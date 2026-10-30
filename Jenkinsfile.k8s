@@ -1,0 +1,110 @@
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Check Tools') {
+            steps {
+                sh '''
+                docker --version
+                kubectl version --client
+                minikube version
+                '''
+            }
+        }
+
+        stage('Start Kubernetes Cluster') {
+            steps {
+                sh '''
+                minikube status || minikube start --driver=docker --cpus=2 --memory=2048
+                kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Build Images') {
+            steps {
+                sh '''
+                eval $(minikube docker-env)
+                docker build -t laravel-app:v1 .
+                docker build -t laravel-web:v1 -f docker/nginx/Dockerfile .
+                '''
+            }
+        }
+
+        stage('Configure Database Connectivity') {
+            steps {
+                sh '''
+                kubectl create secret generic laravel-env --from-env-file=.env.docker --dry-run=client -o yaml | kubectl apply -f -
+                '''
+            }
+        }
+
+        stage('Deploy Database Tier') {
+            steps {
+                sh '''
+                kubectl apply -f k8s/mysql.yaml
+                kubectl rollout status deployment/db --timeout=300s
+                '''
+            }
+        }
+
+        stage('Deploy Application and Web Tiers') {
+            steps {
+                sh '''
+                kubectl apply -f k8s/app.yaml
+                kubectl apply -f k8s/web.yaml
+                kubectl rollout restart deployment/app deployment/web
+                kubectl rollout status deployment/app --timeout=300s
+                kubectl rollout status deployment/web --timeout=300s
+                '''
+            }
+        }
+
+        stage('Verify Application Is Running') {
+            steps {
+                sh '''
+                kubectl delete pod web-check --ignore-not-found
+                OK=0
+                for i in $(seq 1 15); do
+                  if kubectl run web-check --rm -i --restart=Never --image=busybox:1.36 -- wget -q -O /dev/null http://web; then
+                    OK=1
+                    echo "Web tier responded successfully"
+                    break
+                  fi
+                  echo "Waiting for web tier..."; sleep 6
+                done
+                [ "$OK" = "1" ] || exit 1
+
+                kubectl exec deploy/app -- php artisan migrate:status
+                kubectl exec deploy/db -- sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "SHOW TABLES;"'
+                kubectl get pods -o wide
+                kubectl get svc
+                kubectl get pvc
+                echo "NodePort HTTP status:"
+                curl -s -o /dev/null -w "%{http_code}\n" http://$(minikube ip):30080 || true
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Laravel 3-tier application is running on Kubernetes'
+        }
+        failure {
+            sh 'kubectl get pods || true'
+            sh 'kubectl logs deploy/app --tail=50 || true'
+            sh 'kubectl logs deploy/db --tail=30 || true'
+        }
+    }
+}
